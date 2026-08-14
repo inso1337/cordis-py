@@ -1,10 +1,18 @@
 """Hot module replacement — the Python equivalent of `@cordisjs/plugin-hmr`.
 
 The JS package drives Node's internal ESM module loader and watches files
-with chokidar.  The Python port reloads changed plugins through
-`importlib.reload` + the registry, watching the file system event-driven via
+with chokidar.  The Python port watches the file system event-driven via
 `watchdog` when it is installed (extra: `cordis[hmr]`), with an mtime-polling
 fallback so the zero-dependency installation keeps working.
+
+The reload itself is transactional, mirroring the JS engine's swap: every
+changed module is re-imported *before* any fiber is disposed (the previous
+module object is kept as backup), and a failure at any point restores the
+backup modules and rebuilds the old fibers, so the system is never left
+half-reloaded.  One limitation is inherent to Python's import system: the JS
+engine classifies the whole import graph and transitively invalidates stale
+entries, while `importlib` cannot rebind the references other modules hold,
+so only the entries whose own module changed are reloaded here.
 """
 
 from __future__ import annotations
@@ -12,6 +20,7 @@ from __future__ import annotations
 import fnmatch
 import importlib
 import os
+import sys
 from typing import Any, Optional
 
 from .service import Service
@@ -216,19 +225,68 @@ class Hmr(Service):
 
     def reload(self, names: list):
         loader = self.ctx.loader
-        for entry in loader.entries():
-            name = entry.options.get("name")
-            if name not in names or entry.fiber is None:
-                continue
-            try:
-                module = importlib.import_module(name)
-                importlib.reload(module)
-                plugin = loader.unwrap_exports(module)
+        entries = [
+            entry
+            for entry in loader.entries()
+            if entry.options.get("name") in names and entry.fiber is not None
+        ]
+        if not entries:
+            return
+
+        # Phase 1 — re-import every changed module before disposing anything.
+        # `importlib.reload` re-executes the code inside the existing module
+        # object, so a failure would leave it half-updated with no way back;
+        # popping the cache and importing afresh instead leaves the previous
+        # module object untouched, serving as the rollback backup exactly like
+        # the JS engine's cache invalidate/restore.
+        backup: dict = {}
+        attempts: dict = {}
+        try:
+            for name in names:
+                backup[name] = sys.modules.get(name)
+                if backup[name] is not None:
+                    sys.modules.pop(name, None)
+                attempts[name] = loader.unwrap_exports(importlib.import_module(name))
+        except BaseException as error:
+            for name, old_module in backup.items():
+                if old_module is not None:
+                    sys.modules[name] = old_module
+            self.ctx.logger.warn(error)
+            return
+
+        # Phase 2 — swap the stale entries' fibers, rolling back on failure.
+        swapped: list = []
+        try:
+            for entry in entries:
+                name = entry.options["name"]
                 old_fiber = entry.fiber
-                self.ctx.registry.delete(old_fiber.runtime.callback)
-                fiber = self.ctx.registry.plugin(plugin, old_fiber.config)
-                fiber.entry = entry
-                entry.fiber = fiber
+                try:
+                    self.ctx.registry.delete(old_fiber.runtime.callback)
+                except BaseException as error:
+                    self.ctx.logger.warn("failed to dispose plugin at %C", name)
+                    self.ctx.logger.warn(error)
+                    raise
+                swapped.append((old_fiber, attempts[name]))
+                self._swap_in(old_fiber, attempts[name])
                 self.ctx.logger.info("reload plugin at %C", name)
-            except BaseException as error:
-                self.ctx.logger.warn(error)
+        except BaseException as error:
+            for name, old_module in backup.items():
+                if old_module is not None:
+                    sys.modules[name] = old_module
+            for old_fiber, new_plugin in swapped:
+                try:
+                    self.ctx.registry.delete(new_plugin)
+                    self._swap_in(old_fiber, old_fiber.runtime.callback)
+                except BaseException as rollback_error:
+                    self.ctx.logger.warn(rollback_error)
+            self.ctx.logger.warn(error)
+
+    def _swap_in(self, old_fiber, plugin):
+        # JS: `oldFiber.parent.registry.plugin(plugin, oldFiber.config)` — the
+        # replacement fiber keeps the original parent context, so entry-level
+        # isolate/intercept keep applying after a reload.
+        fiber = old_fiber.parent.registry.plugin(plugin, old_fiber.config)
+        fiber.entry = old_fiber.entry
+        if fiber.entry is not None:
+            fiber.entry.fiber = fiber
+        return fiber

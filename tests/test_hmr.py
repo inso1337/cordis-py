@@ -43,6 +43,14 @@ def touch_hmr_plugin(value):
     os.utime(HMR_PLUGIN, (stat.st_atime + 2, stat.st_mtime + 2))
 
 
+def write_raw(content):
+    with open(HMR_PLUGIN, "w", encoding="utf-8") as file:
+        file.write(content)
+    # bump mtime deterministically
+    stat = os.stat(HMR_PLUGIN)
+    os.utime(HMR_PLUGIN, (stat.st_atime + 2, stat.st_mtime + 2))
+
+
 async def test_hmr_reloads_changed_plugin(monkeypatch):
     monkeypatch.setattr(hmr_module, "WATCHDOG_AVAILABLE", False)
     write_hmr_plugin("first")
@@ -124,4 +132,96 @@ async def test_hmr_watchdog_events():
                 break
         assert ctx.bail("hmr/get-value") == "second"
     finally:
+        os.path.exists(HMR_PLUGIN) and os.remove(HMR_PLUGIN)
+
+
+async def _setup_hmr(monkeypatch):
+    """Shared fixture: polling HMR over the fixture plugin, value == 'first'."""
+    monkeypatch.setattr(hmr_module, "WATCHDOG_AVAILABLE", False)
+    write_hmr_plugin("first")
+    import sys
+
+    sys.modules.pop("tests.fixtures.hmr_plugin", None)
+    clock = FakeClock()
+    set_clock(clock)
+    ctx = Context()
+    loader = await install(ctx)
+    loader.modules["__cordis_timer__"] = TimerService
+    loader.modules["hmr"] = Hmr
+    await loader.create({"name": "__cordis_timer__"})
+    await loader.create({"name": "hmr", "config": {"debounce": 10}})
+    await loader.create({"name": "tests.fixtures.hmr_plugin"})
+    for _ in range(50):
+        await sleep()
+    # let the poll register file snapshots before the change
+    for _ in range(3):
+        await clock.advance(20)
+    entry = next(e for e in loader.entries() if e.options.get("name") == "tests.fixtures.hmr_plugin")
+    return ctx, loader, entry, clock
+
+
+async def test_hmr_reload_preserves_entry_context(monkeypatch):
+    try:
+        ctx, loader, entry, clock = await _setup_hmr(monkeypatch)
+        old_fiber = entry.fiber
+        old_parent = old_fiber.parent
+        assert ctx.bail("hmr/get-value") == "first"
+
+        touch_hmr_plugin("second")
+        for _ in range(50):
+            await clock.advance(20)
+        assert ctx.bail("hmr/get-value") == "second"
+        assert entry.fiber is not old_fiber
+        # JS: `oldFiber.parent.registry.plugin(...)` — the replacement keeps
+        # the entry's context, so isolate/intercept still apply after reload
+        assert entry.fiber.parent is old_parent
+    finally:
+        set_clock(None)
+        os.path.exists(HMR_PLUGIN) and os.remove(HMR_PLUGIN)
+
+
+async def test_hmr_failed_import_keeps_old_plugin(monkeypatch):
+    try:
+        ctx, loader, entry, clock = await _setup_hmr(monkeypatch)
+        old_fiber = entry.fiber
+        assert ctx.bail("hmr/get-value") == "first"
+
+        write_raw("def broken(:\n")
+        for _ in range(50):
+            await clock.advance(20)
+
+        # transaction aborts: the old fiber keeps serving and the previous
+        # module object is restored into the import cache
+        import sys
+
+        assert entry.fiber is old_fiber
+        assert ctx.bail("hmr/get-value") == "first"
+        assert sys.modules["tests.fixtures.hmr_plugin"].value == "first"
+    finally:
+        set_clock(None)
+        os.path.exists(HMR_PLUGIN) and os.remove(HMR_PLUGIN)
+
+
+async def test_hmr_failed_swap_rolls_back(monkeypatch):
+    try:
+        ctx, loader, entry, clock = await _setup_hmr(monkeypatch)
+        old_fiber = entry.fiber
+        assert ctx.bail("hmr/get-value") == "first"
+
+        # imports fine, but exports no plugin (no `apply`) → the swap fails
+        # after the old fiber was disposed → rollback rebuilds the old fiber
+        write_raw('value = "second"\n')
+        for _ in range(50):
+            await clock.advance(20)
+        for _ in range(50):
+            await sleep()
+
+        import sys
+
+        assert entry.fiber is not old_fiber
+        assert entry.fiber.uid is not None
+        assert ctx.bail("hmr/get-value") == "first"
+        assert sys.modules["tests.fixtures.hmr_plugin"].value == "first"
+    finally:
+        set_clock(None)
         os.path.exists(HMR_PLUGIN) and os.remove(HMR_PLUGIN)

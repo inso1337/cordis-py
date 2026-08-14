@@ -328,7 +328,12 @@ class Fiber:
                     fiber_self.ctx.logger.error(error)
                     fiber_self._error = error
 
-                async def disposer():
+                def disposer():
+                    # JS: an async disposer runs its synchronous prefix at
+                    # call time — uid retirement and the registry bookkeeping
+                    # must observe the state at the moment of disposal, not a
+                    # loop turn later (HMR deletes and re-registers a runtime
+                    # within one synchronous sequence).
                     fiber_self.uid = None
                     fiber_self.context.emit("internal/plugin", fiber_self)
                     if fiber_self.ctx.registry.has(runtime.callback):
@@ -336,8 +341,12 @@ class Fiber:
                         if not runtime.fibers.length:
                             fiber_self.ctx.registry.delete(runtime.callback)
                     fiber_self._set_epoch(INACTIVE)
-                    while fiber_self.inertia is not None:
-                        await fiber_self.inertia
+
+                    async def rest():
+                        while fiber_self.inertia is not None:
+                            await fiber_self.inertia
+
+                    return rest()
 
                 return disposer
 
