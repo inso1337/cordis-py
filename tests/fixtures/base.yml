@@ -1,0 +1,8 @@
+- id: timer
+  name: tests.fixtures.timer_plugin
+- id: group
+  name: '@cordisjs/plugin-group'
+  group: true
+  config:
+    - id: inner
+      name: tests.fixtures.test_plugin

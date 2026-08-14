@@ -1,0 +1,37 @@
+[project]
+name = "cordis"
+version = "4.0.0"
+description = "Meta-Framework for Modern Applications — a pure Python port of cordis"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Cordis Python Port Contributors" }]
+keywords = ["dependency-injection", "plugin", "framework", "cordis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+hmr = ["watchdog>=4.0"]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pyyaml>=6.0", "watchdog>=4.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cordis"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
