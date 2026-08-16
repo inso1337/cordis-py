@@ -126,6 +126,9 @@ class _PendingTask:
         self._start()
         return self._task.__await__()
 
+    def done(self) -> bool:
+        return self._task is not None and self._task.done()
+
 
 class _LazyTask:
     """Like `_PendingTask`, but with an eagerly-run synchronous prefix."""
@@ -153,10 +156,13 @@ def _make_disposer(disposables: list) -> Callable:
         snapshot = disposables[:]
         disposables.clear()
         for d in reversed(snapshot):
+            # a collected child effect may already be running its own async
+            # cleanup — join it instead of observing a single-shot no-op
+            call = d._join if isinstance(d, FiberEffect) else d
             if task is not None:
-                task = _then(task, d)
+                task = _then(task, call)
             else:
-                result = _start_now(d())
+                result = _start_now(call())
                 if _is_awaitable(result):
                     task = result
         return task
@@ -205,30 +211,114 @@ class _EffectRunner:
 
 
 class FiberEffect:
-    """The disposer returned by `ctx.effect()` — callable and awaitable."""
+    """The disposer returned by `ctx.effect()` — callable and awaitable.
 
-    __slots__ = ("_runner", "_task", "_dispose", "_meta", "_ctx")
+    Reentrancy contract (ported from the hardened upstream fiber):
 
-    def __init__(self, ctx, runner: _EffectRunner, task, dispose: Callable, meta: dict):
+    - the wrapper joins its owner's disposable list *before* the setup
+      callback runs, so an unload snapshot taken from inside setup still
+      contains it;
+    - disposal is single-flight: the first call starts it, repeated public
+      calls stay no-ops, and internal composition (`_join`) joins the same
+      in-flight cleanup instead of skipping it;
+    - the wrapper leaves its owner's disposable list only once its cleanup
+      has fully settled, so an owner unloading mid-cleanup awaits it.
+    """
+
+    __slots__ = ("_runner", "_task", "_dispose", "_meta", "_ctx", "_remove", "_executing", "_disposal")
+
+    def __init__(self, ctx, runner: _EffectRunner, dispose: Callable, meta: dict):
         self._ctx = ctx
         self._runner = runner
-        self._task = task
+        self._task = None
         self._dispose = dispose
         self._meta = meta
+        self._remove = None
+        self._executing = True
+        self._disposal = None
 
     @property
     def __cordis_effect__(self):
         return self._meta
 
+    def _finish_setup(self, task) -> None:
+        self._task = task
+        self._executing = False
+
+    def _fail_setup(self) -> None:
+        """Synchronous setup failure: roll back the cleanup collected so far
+        and leave the owner's disposable list."""
+        self._executing = False
+        self._runner.epoch = False
+        if self._disposal is not None:
+            # a reentrant dispose is already waiting on setup — let it finish
+            return
+        self._disposal = _NoopDispose()
+        try:
+            result = self._dispose()
+            if _is_awaitable(result):
+                _start_now(result, log=self._ctx.logger.error)
+        finally:
+            self._finalize()
+
+    def _finalize(self) -> None:
+        remove, self._remove = self._remove, None
+        if remove is not None:
+            remove()
+
+    def _join(self):
+        """Internal composition: join an in-flight (or completed) cleanup."""
+        if self._disposal is not None:
+            return self._disposal
+        return self()
+
     def __call__(self):
-        if not self._runner.epoch:
+        if self._disposal is not None or not self._runner.epoch:
             return _NoopDispose()
         self._runner.epoch = False
+        settled = self._task is None or getattr(self._task, "done", lambda: False)()
+        if not self._executing and settled:
+            # setup has settled (synchronously, or its task already finished
+            # — e.g. the auto-dispose guard after a failed setup) — dispose
+            # eagerly, so the synchronous prefix of cleanup runs at call time
+            try:
+                result = self._dispose()
+            except BaseException:
+                self._disposal = _NoopDispose()
+                self._finalize()
+                raise
+            if _is_awaitable(result):
+                self._disposal = _start_now(self._finish_async(result), log=self._ctx.logger.error)
+                return self._disposal
+            self._disposal = _NoopDispose()
+            self._finalize()
+            return self._disposal
+        self._disposal = _start_now(self._run_disposal(), log=self._ctx.logger.error)
+        return self._disposal
+
+    async def _finish_async(self, result):
+        try:
+            await result
+        finally:
+            self._finalize()
+
+    async def _run_disposal(self):
+        # the setup's synchronous prefix cannot be preempted by this
+        # coroutine, but guard against being driven without a loop
+        while self._executing:
+            await asyncio.sleep(0)
         if self._task is not None:
-            result = _then(self._task, self._dispose)
-        else:
-            result = _await_or_none(self._dispose())
-        return _start_now(result, log=self._ctx.logger.error)
+            try:
+                await self._task
+            except BaseException as reason:
+                # cleanup still runs below; surface the setup failure once
+                self._ctx.logger.error(reason)
+        try:
+            result = self._dispose()
+            if _is_awaitable(result):
+                await result
+        finally:
+            self._finalize()
 
     def __await__(self):
         async def run():
@@ -251,30 +341,38 @@ class Runtime:
         self.Config = Config
 
 
-def _make_guard(ctx, dispose: Callable):
+def _make_effect_guard(wrapper: "FiberEffect"):
+    """Auto-dispose an effect whose async setup failed. Disposal is
+    single-flight, so this is a no-op when a reentrant dispose is already
+    waiting on the failed setup."""
+
     def done(t: asyncio.Task) -> None:
         if t.cancelled():
             return
-        exc = t.exception()
-        if exc is None:
+        if t.exception() is None:
             return
-        try:
-            result = dispose()
-            if _is_awaitable(result):
-                sub = asyncio.ensure_future(result)
-
-                def sub_done(st: asyncio.Task) -> None:
-                    if st.cancelled():
-                        return
-                    err = st.exception()
-                    if err is not None:
-                        ctx.logger.error(err)
-
-                sub.add_done_callback(sub_done)
-        except BaseException as error:  # pragma: no cover
-            ctx.logger.error(error)
+        wrapper()
 
     return done
+
+
+def _emit_plugin_disposed(context, fiber) -> None:
+    """Emit `internal/plugin` for a disposing fiber, containing each
+    observer's failure so one callback cannot starve its peers or interrupt
+    the ownership cleanup that follows."""
+    args = ["internal/plugin", fiber]
+    try:
+        this_arg, callbacks = context.events._resolve("emit", args)
+    except BaseException as error:
+        context.logger.error(error)
+        return
+    for callback in callbacks:
+        try:
+            result = callback(this_arg, *args)
+            if _is_awaitable(result):
+                _start_now(result, log=context.logger.error)
+        except BaseException as error:
+            context.logger.error(error)
 
 
 class Fiber:
@@ -312,18 +410,12 @@ class Fiber:
 
             self._runner = _EffectRunner(INACTIVE, self._execute_plugin, collect, get_outer_stack)
 
-            self.context.emit("internal/plugin", self)
-
-            for name in list(self.inject.keys()):
-                self._check_impl(name)
-
             fiber_self = self
 
             def plugin_effect():
                 remove = runtime.fibers.push(fiber_self)
                 try:
                     fiber_self.config = resolve_config(runtime, config)
-                    fiber_self._refresh()
                 except BaseException as error:
                     fiber_self.ctx.logger.error(error)
                     fiber_self._error = error
@@ -335,12 +427,21 @@ class Fiber:
                     # loop turn later (HMR deletes and re-registers a runtime
                     # within one synchronous sequence).
                     fiber_self.uid = None
-                    fiber_self.context.emit("internal/plugin", fiber_self)
+                    _emit_plugin_disposed(fiber_self.context, fiber_self)
                     if fiber_self.ctx.registry.has(runtime.callback):
                         remove()
                         if not runtime.fibers.length:
                             fiber_self.ctx.registry.delete(runtime.callback)
                     fiber_self._set_epoch(INACTIVE)
+                    if fiber_self.inertia is None and fiber_self._disposables.length:
+                        # a fiber that never activated still owns effects
+                        # attached while it was pending (e.g. listeners
+                        # registered on its context) — drain them
+                        def transition():
+                            fiber_self.inertia = fiber_self._start_unload()
+                            return FiberState.UNLOADING
+
+                        fiber_self._update_state(transition)
 
                     async def rest():
                         while fiber_self.inertia is not None:
@@ -350,7 +451,24 @@ class Fiber:
 
                 return disposer
 
+            # the fiber registers with its owner before publication, so a
+            # creation observer that disposes it (or throws) cannot orphan it
             self.dispose = parent.fiber.effect(plugin_effect, "ctx.plugin()")
+
+            try:
+                self.context.emit("internal/plugin", self)
+            except BaseException:
+                result = self.dispose()
+                if _is_awaitable(result):
+                    _start_now(result, log=self.ctx.logger.error)
+                raise
+
+            # resolve dependency declarations (including any added by the
+            # notification above) before the first activation
+            if self.uid is not None and parent.fiber.state != FiberState.UNLOADING:
+                for name in list(self.inject.keys()):
+                    self._check_impl(name)
+                self._refresh()
         else:
             self.uid = 0
             self.ctx = self.context = parent
@@ -426,6 +544,9 @@ class Fiber:
 
     def effect(self, execute: Callable, label: str = "anonymous") -> FiberEffect:
         self.assert_active()
+        if self.state == FiberState.UNLOADING:
+            # a cleanup-time registration would escape the unload snapshot
+            raise CordisError("INACTIVE_EFFECT")
 
         disposables: list = []
         dispose = _make_disposer(disposables)
@@ -441,20 +562,22 @@ class Fiber:
 
         runner = _EffectRunner(True, execute, collect, build_outer_stack())
 
+        # ownership before execution: the wrapper joins the owner's
+        # disposables first, so an unload snapshot taken from inside the
+        # setup callback still contains it
+        wrapper = FiberEffect(self.ctx, runner, dispose, meta)
+        wrapper._remove = self._disposables.push(wrapper)
+
         task = None
         try:
             task = self._execute(runner)
         except BaseException:
-            dispose()
+            wrapper._fail_setup()
             raise
 
         if task is not None:
-            pending = _PendingTask(task, on_done=_make_guard(self.ctx, dispose))
-            task = pending
-
-        wrapper = FiberEffect(self.ctx, runner, task, dispose, meta)
-        remover = self._disposables.push(wrapper)
-        disposables.append(remover)
+            task = _PendingTask(task, on_done=_make_effect_guard(wrapper))
+        wrapper._finish_setup(task)
         return wrapper
 
     def get_effects(self) -> list:
@@ -545,9 +668,14 @@ class Fiber:
         async def run():
             try:
                 await asyncio.sleep(0)
-                result = fiber._execute(fiber._runner)
-                if _is_awaitable(result):
-                    await result
+                # a reentrant disposal may have invalidated the epoch before
+                # this first checkpoint — skip plugin execution entirely then
+                if fiber._runner.epoch == old_epoch:
+                    result = fiber._execute(fiber._runner)
+                    if _is_awaitable(result):
+                        await result
+                    # a successful reload leaves no stale failure behind
+                    fiber._error = None
             except BaseException as reason:
                 fiber.ctx.logger.error(reason)
                 fiber._error = reason
@@ -583,7 +711,9 @@ class Fiber:
 
     async def _dispose_safe(self, dispose) -> None:
         try:
-            result = dispose()
+            # join a cleanup that is already in flight (see FiberEffect)
+            call = dispose._join if isinstance(dispose, FiberEffect) else dispose
+            result = call()
             if _is_awaitable(result):
                 await result
         except BaseException as reason:
