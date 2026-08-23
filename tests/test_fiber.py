@@ -123,6 +123,42 @@ async def test_plugin_error():
     assert len(callback.calls) == 1
 
 
+async def test_async_body_setup_failure_lands_failed():
+    """An effect whose body is an *async* generator (an `await` inside a
+    component body makes it one) and whose setup fails mid-way must land the
+    owning fiber FAILED with the error recorded — the same as a synchronous
+    body (`test_plugin_error`) — while its accumulated inverses still run
+    newest-first with no residue.
+
+    Regression guard for the async-body error-routing fix: previously the
+    async setup failure was routed only to the auto-dispose guard, so the
+    inverses ran but the fiber stayed ACTIVE and the error was dropped."""
+    root = Context()
+    error = Mock()
+    root.logger.error = error
+    inverses = []
+
+    def apply(ctx, config):
+        async def body():
+            yield lambda: inverses.append("a")  # inverse for the first step
+            yield lambda: inverses.append("b")  # inverse for the second step
+            await asyncio.sleep(0)  # A1 boundary — makes body an async generator
+            raise Exception("async setup boom")
+
+        ctx.effect(body, "app/body")
+
+    fiber = root.plugin(apply)
+    await sleep()
+
+    # the fiber lands FAILED with the error recorded (was ACTIVE before the fix)
+    assert fiber.state == FiberState.FAILED
+    assert fiber._error is not None
+    assert str(fiber._error) == "async setup boom"
+    # containment still holds: inverses ran newest-first, no residue
+    assert inverses == ["b", "a"]
+    assert len(error.calls) >= 1
+
+
 async def test_dispose_error():
     root = Context()
     error = Mock()

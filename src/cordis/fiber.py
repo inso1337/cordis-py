@@ -341,17 +341,38 @@ class Runtime:
         self.Config = Config
 
 
-def _make_effect_guard(wrapper: "FiberEffect"):
-    """Auto-dispose an effect whose async setup failed. Disposal is
-    single-flight, so this is a no-op when a reentrant dispose is already
-    waiting on the failed setup."""
+def _make_effect_guard(fiber: "Fiber", wrapper: "FiberEffect"):
+    """Handle an effect whose async setup failed.
+
+    Two things must happen, mirroring the synchronous setup path (where the
+    exception raised by `Fiber._execute` propagates out of `Fiber.effect` and
+    is caught by `_start_reload`'s handler):
+
+    1. the accumulated inverses are rolled back, newest first, via the
+       wrapper's disposal — single-flight, so this is a no-op when a reentrant
+       dispose is already waiting on the failed setup;
+    2. the setup error is recorded on the owning fiber's error slot and the
+       fiber's state re-derived, so it lands `FAILED` with the error recorded
+       rather than staying `ACTIVE`.
+
+    Before this fix only (1) happened, so an async body's mid-setup failure
+    contained its effects (no residue) but left the fiber `ACTIVE`."""
 
     def done(t: asyncio.Task) -> None:
         if t.cancelled():
             return
-        if t.exception() is None:
+        error = t.exception()
+        if error is None:
             return
+        # (1) roll back the accumulated inverses, newest first
         wrapper()
+        # (2) route the failure to the fiber's error slot, matching the
+        # synchronous path in `_start_reload`: record the error, retire the
+        # runner epoch, and re-derive the fiber state (now `FAILED`).
+        fiber.ctx.logger.error(error)
+        fiber._error = error
+        fiber._runner.epoch = INACTIVE
+        fiber._update_state(lambda: None)
 
     return done
 
@@ -576,7 +597,7 @@ class Fiber:
             raise
 
         if task is not None:
-            task = _PendingTask(task, on_done=_make_effect_guard(wrapper))
+            task = _PendingTask(task, on_done=_make_effect_guard(self, wrapper))
         wrapper._finish_setup(task)
         return wrapper
 
