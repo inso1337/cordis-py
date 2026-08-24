@@ -148,7 +148,7 @@ class RegistryService:
                 name = None
             from .utils import DisposableList
 
-            runtime = Runtime(name=name, callback=callback, fibers=DisposableList(), Config=getattr(plugin, "Config", None))
+            runtime = Runtime(name=name, callback=callback, fibers=DisposableList(), Config=plugin.get("Config") if isinstance(plugin, dict) else getattr(plugin, "Config", None))
             self._internal[callback] = runtime
 
         inject = plugin.get("inject") if isinstance(plugin, dict) else getattr(plugin, "inject", None)
