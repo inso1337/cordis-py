@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
@@ -177,11 +178,28 @@ def get_property_chain(obj: Any, name: str):
 
 
 def build_outer_stack(offset: int = 0) -> Callable[[], list[str]]:
-    """Capture the current stack frame list for later error decoration."""
-    import traceback
+    """Capture the current stack frame list for later error decoration.
 
-    stack = traceback.extract_stack()[:-1 - offset]
-    return lambda: [f"    at {frame.filename}:{frame.lineno} in {frame.name}" for frame in stack]
+    Runs on every effect, and the lines are read only when one fails, so
+    only `(filename, lineno, name)` per frame is taken here, by a plain
+    walk of `f_back`. The text is built when the returned callable is
+    called. No frame is held, so no locals are kept alive. The lines are
+    the ones `traceback.extract_stack()[:-1 - offset]` gave, without its
+    `linecache` pass (the lines print no source text): the same frames,
+    the same `sys.tracebacklimit` rule, the same slice.
+    """
+    limit = getattr(sys, "tracebacklimit", None)
+    if limit is not None and limit < 0:
+        limit = 0
+    entries = []
+    frame = sys._getframe()  # this frame, as `extract_stack` starts here
+    while frame is not None and (limit is None or len(entries) < limit):
+        code = frame.f_code
+        entries.append((code.co_filename, frame.f_lineno, code.co_name))
+        frame = frame.f_back
+    entries.reverse()
+    stack = entries[:-1 - offset]
+    return lambda: [f"    at {filename}:{lineno} in {name}" for filename, lineno, name in stack]
 
 
 def compose_error(callback, get_outer_stack=None):
